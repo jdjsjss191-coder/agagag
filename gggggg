@@ -4,65 +4,39 @@
 --       Nothing is cached into a local that could drift from config.
 
 -- ============================================================================
--- KEY VALIDATION (runs automatically when mooze.txt loads)
+-- KEY VALIDATION
 -- ============================================================================
-local API_URL = "https://bypass-production-5fff.up.railway.app"
+do
+    local userKey = tostring(shared.VyronKey or "")
+    assert(userKey ~= "" and userKey ~= "YOUR_KEY_HERE", "[Vyron] No key set in config.lua.")
 
-local function KickPlayer(reason)
-    game:GetService("Players").LocalPlayer:Kick(
-        "\n\n🔒 Vyron.cc\n\n" .. reason .. "\n\nContact staff if you believe this is a mistake."
-    )
-end
+    local hwid = tostring(game:GetService("RbxAnalyticsService"):GetClientId())
+    local API  = "https://bypass-production-5fff.up.railway.app/check"
 
-local key = shared.VyronKey
-if not key or key == "" or key == "YOUR_KEY_HERE" then
-    KickPlayer("❌ No key provided.\nPlease enter your key in config.lua.")
-    return
-end
+    local valid  = false
+    local reason = "Invalid key"
 
-local hwid = tostring(game:GetService("Players").LocalPlayer.UserId)
-pcall(function()
-    local id = game:GetService("RbxAnalyticsService"):GetClientId()
-    if id and id ~= "" then hwid = id end
-end)
+    local ok, res = pcall(function()
+        return game:HttpGet(API .. "?key=" .. userKey .. "&hwid=" .. hwid)
+    end)
 
-local ok, response = pcall(function()
-    return game:HttpGet(API_URL .. "/check?key=" .. key .. "&hwid=" .. hwid)
-end)
-
-if not ok or not response then
-    KickPlayer("❌ Could not reach the Vyron auth server.\nPlease try again later.")
-    return
-end
-
-local parsed
-local parseOk = pcall(function()
-    parsed = game:GetService("HttpService"):JSONDecode(response)
-end)
-
-if not parseOk or not parsed then
-    KickPlayer("❌ Invalid response from auth server.\nPlease try again later.")
-    return
-end
-
-if not parsed.valid then
-    local reason = parsed.reason or "Unknown error"
-    if reason == "Invalid key" then
-        KickPlayer("❌ Invalid key.\nThis key does not exist. Make sure you entered it correctly.")
-    elseif reason == "Key expired" then
-        KickPlayer("⏰ Your key has expired!\nBuy a new one to get back in action.")
-    elseif reason == "HWID mismatch" then
-        KickPlayer("🖥️ HWID mismatch.\nThis key is bound to a different device.\nContact staff to reset your HWID.")
-    elseif reason:find("Blacklisted") then
-        local bl_reason = reason:match("Blacklisted: (.+)") or "No reason provided"
-        KickPlayer("🚫 You are blacklisted from Vyron.\n\nReason: " .. bl_reason)
-    else
-        KickPlayer("❌ Access denied: " .. reason)
+    if ok and res then
+        pcall(function()
+            local data = game:GetService("HttpService"):JSONDecode(res)
+            valid  = data.valid
+            reason = data.reason or reason
+        end)
     end
-    return
-end
 
-print("[Vyron] Key validated ✓")
+    if not valid then
+        game:GetService("Players").LocalPlayer:Kick(
+            "\n\n🔒 Vyron.cc\n\n" .. reason .. "\n\nContact staff if you believe this is a mistake."
+        )
+        return
+    end
+
+    print("[Vyron] Key validated ✓")
+end
 
 local Services = {
     Players         = game:GetService("Players"),
