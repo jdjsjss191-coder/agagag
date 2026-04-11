@@ -38,6 +38,32 @@ do
     print("[Vyron] Key validated ✓")
 end
 
+-- ============================================================================
+-- HEARTBEAT (keeps session alive + listens for kick commands)
+-- ============================================================================
+do
+    local userKey = tostring(shared.VyronKey or "")
+    local hwid    = tostring(game:GetService("RbxAnalyticsService"):GetClientId())
+    local API     = "https://bypass-production-5fff.up.railway.app/heartbeat"
+    local HttpService = game:GetService("HttpService")
+    local Players     = game:GetService("Players")
+
+    task.spawn(function()
+        while true do
+            task.wait(15)
+            pcall(function()
+                local res = game:HttpGet(API .. "?key=" .. userKey .. "&hwid=" .. hwid)
+                local data = HttpService:JSONDecode(res)
+                if data.kick then
+                    Players.LocalPlayer:Kick(
+                        "\n\n🔒 Vyron.cc\n\nYou have been kicked by staff.\n\nReason: " .. (data.reason or "No reason provided")
+                    )
+                end
+            end)
+        end
+    end)
+end
+
 local Services = {
     Players         = game:GetService("Players"),
     RunService      = game:GetService("RunService"),
