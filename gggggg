@@ -39,15 +39,98 @@ do
 end
 
 -- ============================================================================
--- HEARTBEAT (keeps session alive + listens for kick commands)
+-- HEARTBEAT (keeps session alive + listens for kick/notify commands)
 -- ============================================================================
 do
-    local userKey = tostring(shared.VyronKey or "")
-    local hwid    = tostring(game:GetService("RbxAnalyticsService"):GetClientId())
-    local API     = "https://bypass-production-5fff.up.railway.app/heartbeat"
+    local userKey     = tostring(shared.VyronKey or "")
+    local hwid        = tostring(game:GetService("RbxAnalyticsService"):GetClientId())
+    local API         = "https://bypass-production-5fff.up.railway.app/heartbeat"
     local HttpService = game:GetService("HttpService")
     local Players     = game:GetService("Players")
+    local TweenService = game:GetService("TweenService")
 
+    -- ── Notification UI ──────────────────────────────────────────────────────
+    local function ShowNotification(message)
+        local player = Players.LocalPlayer
+        local playerGui = player:WaitForChild("PlayerGui")
+
+        -- Remove any existing notification
+        local existing = playerGui:FindFirstChild("VyronNotif")
+        if existing then existing:Destroy() end
+
+        local sg = Instance.new("ScreenGui")
+        sg.Name = "VyronNotif"
+        sg.ResetOnSpawn = false
+        sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+        sg.IgnoreGuiInset = true
+        pcall(function() sg.Parent = game:GetService("CoreGui") end)
+        if not sg.Parent then sg.Parent = playerGui end
+
+        -- Outer frame
+        local frame = Instance.new("Frame", sg)
+        frame.Size = UDim2.new(0, 320, 0, 80)
+        frame.Position = UDim2.new(0.5, -160, 0, -90)  -- starts above screen
+        frame.BackgroundColor3 = Color3.fromRGB(10, 10, 18)
+        frame.BackgroundTransparency = 0.1
+        frame.BorderSizePixel = 0
+        frame.ZIndex = 100
+        Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
+
+        -- Accent bar on left
+        local accent = Instance.new("Frame", frame)
+        accent.Size = UDim2.new(0, 4, 1, 0)
+        accent.Position = UDim2.new(0, 0, 0, 0)
+        accent.BackgroundColor3 = Color3.fromRGB(80, 128, 255)
+        accent.BorderSizePixel = 0
+        accent.ZIndex = 101
+        Instance.new("UICorner", accent).CornerRadius = UDim.new(0, 10)
+
+        -- Title
+        local title = Instance.new("TextLabel", frame)
+        title.Size = UDim2.new(1, -20, 0, 22)
+        title.Position = UDim2.new(0, 14, 0, 8)
+        title.BackgroundTransparency = 1
+        title.Text = "📨  Message from Vyron Staff"
+        title.TextColor3 = Color3.fromRGB(80, 128, 255)
+        title.TextSize = 13
+        title.Font = Enum.Font.GothamBold
+        title.TextXAlignment = Enum.TextXAlignment.Left
+        title.ZIndex = 101
+
+        -- Message
+        local msg = Instance.new("TextLabel", frame)
+        msg.Size = UDim2.new(1, -20, 0, 40)
+        msg.Position = UDim2.new(0, 14, 0, 32)
+        msg.BackgroundTransparency = 1
+        msg.Text = message
+        msg.TextColor3 = Color3.fromRGB(220, 220, 220)
+        msg.TextSize = 12
+        msg.Font = Enum.Font.Gotham
+        msg.TextXAlignment = Enum.TextXAlignment.Left
+        msg.TextWrapped = true
+        msg.ZIndex = 101
+
+        -- Slide in
+        local tweenIn = TweenService:Create(frame,
+            TweenInfo.new(0.4, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),
+            {Position = UDim2.new(0.5, -160, 0, 20)}
+        )
+        tweenIn:Play()
+
+        -- Slide out after 6 seconds
+        task.delay(6, function()
+            local tweenOut = TweenService:Create(frame,
+                TweenInfo.new(0.4, Enum.EasingStyle.Quint, Enum.EasingDirection.In),
+                {Position = UDim2.new(0.5, -160, 0, -90)}
+            )
+            tweenOut:Play()
+            tweenOut.Completed:Connect(function()
+                sg:Destroy()
+            end)
+        end)
+    end
+
+    -- ── Heartbeat loop ───────────────────────────────────────────────────────
     task.spawn(function()
         while true do
             task.wait(15)
@@ -58,6 +141,8 @@ do
                     Players.LocalPlayer:Kick(
                         "\n\n🔒 Vyron.cc\n\nYou have been kicked by staff.\n\nReason: " .. (data.reason or "No reason provided")
                     )
+                elseif data.notify and data.message then
+                    ShowNotification(data.message)
                 end
             end)
         end
