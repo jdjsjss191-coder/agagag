@@ -1,0 +1,942 @@
+-- mooze.txt | Vyron Logic
+-- Run config.lua first. It sets shared.Vyron.
+-- RULE: every feature reads shared.Vyron directly at runtime.
+--       Nothing is cached into a local that could drift from config.
+
+local Services = {
+    Players        = game:GetService("Players"),
+    RunService     = game:GetService("RunService"),
+    UserInputService = game:GetService("UserInputService"),
+    TweenService   = game:GetService("TweenService"),
+    Workspace      = workspace,
+    CoreGui        = game.CoreGui,
+}
+
+local function SafeCall(f,...) local ok,r=pcall(f,...); return ok and r or nil end
+
+local Capabilities = {
+    SafeCall(function() return hookfunction  ~= nil end) or false,
+    SafeCall(function() return getconnections ~= nil end) or false,
+    SafeCall(function() return getupvalues   ~= nil end) or false,
+    SafeCall(function() return identifyexecutor ~= nil end) or false,
+    SafeCall(function() return getrawmetatable ~= nil end) or false,
+}
+
+local ExecutorName = "Unknown"
+if Capabilities[4] then ExecutorName = identifyexecutor() end
+
+-- ============================================================================
+-- NOTIFICATION (disabled)
+-- ============================================================================
+local function ShowNotification() end
+
+print("[Vyron] Running on:", ExecutorName)
+print("[Vyron] Hooking:",   Capabilities[1] and "v" or "x")
+print("[Vyron] Metatable:", Capabilities[5] and "v" or "x")
+
+-- ============================================================================
+-- CONFIG GUARD
+-- ============================================================================
+assert(shared.Vyron,                "[Vyron] Config not found. Run config.lua first.")
+assert(shared.Vyron["Silent Aim"],  "[Vyron] Invalid config - missing Silent Aim section.")
+
+-- shorthand that always reads live from config
+local function CFG() return shared.Vyron end
+
+-- ============================================================================
+-- AC BYPASS
+-- ============================================================================
+if Capabilities[1] and Capabilities[2] and Capabilities[3] then
+    print("[Vyron] Initializing AC bypass...")
+    local MessageOut = game:GetService("LogService").MessageOut
+    local function BypassConnection(conn)
+        pcall(function()
+            local ut = getupvalues(conn.Function)[9]
+            if ut then
+                local tf = ut[1]
+                setupvalue(tf,14,function(...) return function(...) local a={...}
+                    if type(a[1])=="table" and a[1][1] then pcall(function()
+                        if type(a[1][1])=="userdata" then
+                            a[1][1]:Disconnect();a[1][2]:Disconnect()
+                            a[1][3]:Disconnect();a[1][4]:Disconnect()
+                        end end) end end end)
+                setupvalue(tf,1,function(...) task.wait(200) end)
+                hookfunction(tf,function(...) return {} end)
+            end
+        end)
+    end
+    local lastT,interval,seen=0,10,{}
+    Services.RunService.Heartbeat:Connect(function()
+        if tick()-lastT<interval then return end; lastT=tick()
+        local ok,conns=pcall(function() return getconnections(MessageOut) end)
+        if ok and conns then for _,c in ipairs(conns) do
+            if not table.find(seen,c) then table.insert(seen,c); task.spawn(BypassConnection,c) end
+        end end
+    end)
+else
+    warn("[Vyron] AC bypass disabled")
+end
+
+-- ============================================================================
+-- SERVICES / LOCALS
+-- ============================================================================
+local Players          = Services.Players
+local LocalPlayer      = Players.LocalPlayer
+local Camera           = Services.Workspace.CurrentCamera
+local RunService       = Services.RunService
+local UserInputService = Services.UserInputService
+
+-- Shared runtime state (NOT config - these are runtime toggles)
+local CamLocked    = false   -- camera lock runtime state
+local CamTarget    = nil     -- camera lock target part
+local SATarget     = nil     -- silent aim locked player (shared with ESP)
+local SAActive     = false   -- silent aim runtime on/off
+
+local BodyParts = {
+    "Head","UpperTorso","HumanoidRootPart","LowerTorso",
+    "LeftHand","RightHand","LeftLowerArm","RightLowerArm",
+    "LeftUpperArm","RightUpperArm","LeftFoot","LeftLowerLeg",
+    "LeftUpperLeg","RightLowerLeg","RightFoot","RightUpperLeg"
+}
+local BodyPartCache = {}
+local function GetBodyParts(char)
+    local now = tick()
+    if not BodyPartCache[char] or (now-(BodyPartCache[char].t or 0))>2 then
+        local p={}
+        for _,n in ipairs(BodyParts) do local pt=char:FindFirstChild(n); if pt then p[#p+1]=pt end end
+        BodyPartCache[char]={parts=p,t=now}
+    end
+    return BodyPartCache[char].parts
+end
+
+local function PlayerDead(p)
+    if not p.Character then return true end
+    local be=p.Character:FindFirstChild("BodyEffects")
+    if be then
+        local d=be:FindFirstChild("Dead"); if d and d.Value then return true end
+        local k=be:FindFirstChild("K.O");  if k and k.Value then return true end
+    end
+    local h=p.Character:FindFirstChildOfClass("Humanoid")
+    return h and h.Health<=0
+end
+
+local function PlayerKnocked(p)
+    if not CFG()["General"]["Checks"]["Knocked"] then return false end
+    if not p.Character then return false end
+    local be=p.Character:FindFirstChild("BodyEffects")
+    if be then local k=be:FindFirstChild("K.O"); if k and k.Value then return true end end
+    return false
+end
+
+-- ============================================================================
+-- ESP  (reads shared.Vyron["ESP"] live every frame)
+-- ============================================================================
+local ESPLabels = {}
+
+local function AddESP(player)
+    if player==LocalPlayer or ESPLabels[player.UserId] then return end
+    local e={player=player, tag=Drawing.new("Text")}
+    e.tag.Visible=false; e.tag.Center=true; e.tag.Outline=true
+    e.tag.Font=Drawing.Fonts.UI; e.tag.ZIndex=1000
+    e.tag.Size=CFG()["ESP"]["Size"]
+    e.tag.Color=CFG()["ESP"]["Color"]
+    ESPLabels[player.UserId]=e
+end
+
+local function RemoveESP(player)
+    local e=ESPLabels[player.UserId]
+    if e then pcall(function() e.tag:Remove() end); ESPLabels[player.UserId]=nil end
+end
+
+local function RefreshESP()
+    local espCfg=CFG()["ESP"]
+    if not espCfg["Enabled"] then
+        for _,e in pairs(ESPLabels) do e.tag.Visible=false end; return
+    end
+    for uid,e in pairs(ESPLabels) do
+        local p=e.player
+        if not p or not p.Parent then
+            pcall(function() e.tag:Remove() end); ESPLabels[uid]=nil; continue
+        end
+        local char=p.Character
+        if not char or PlayerDead(p) then e.tag.Visible=false; continue end
+        local hrp=char:FindFirstChild("HumanoidRootPart")
+        if not hrp then e.tag.Visible=false; continue end
+        -- anchor at feet: HRP is at hip height (~3 studs above ground), so subtract ~3
+        local feetPos = hrp.Position - Vector3.new(0, 3, 0)
+        local sp,on=Camera:WorldToViewportPoint(feetPos)
+        if on and sp.Z>0 then
+            e.tag.Position=Vector2.new(sp.X, sp.Y+espCfg["Offset"])
+            local dn=p.DisplayName
+            e.tag.Text=(dn and dn~="") and dn or p.Name
+            e.tag.Size=espCfg["Size"]
+            e.tag.Color=(p==SATarget or (CamLocked and CamTarget and CamTarget.Parent==p.Character)) and espCfg["Target Color"] or espCfg["Color"]
+            e.tag.Visible=true
+        else
+            e.tag.Visible=false
+        end
+    end
+end
+
+for _,p in ipairs(Players:GetPlayers()) do AddESP(p) end
+Players.PlayerAdded:Connect(function(p)
+    if p~=LocalPlayer then
+        AddESP(p)
+        p.CharacterAdded:Connect(function() task.wait(0.1); RemoveESP(p); AddESP(p) end)
+    end
+end)
+Players.PlayerRemoving:Connect(RemoveESP)
+RunService.Heartbeat:Connect(RefreshESP)
+
+-- ============================================================================
+-- HOTKEY LABELS  (mirrors Script:UpdateLabels() from reference exactly)
+-- Uses Drawing.new("Text") with identical style: blue rgb(143,174,211), size 13,
+-- outline, centered. Only shows when feature is actively ON.
+-- Stacks downward from near the bottom of the screen (offsetY starts at
+-- viewportSize.Y - 120, each label adds 15px down).
+-- ============================================================================
+
+-- Clear any orphaned Drawing objects from previous script runs
+pcall(function()
+    for _, d in pairs(Drawing.getDrawings and Drawing.getDrawings() or {}) do
+        if d and d.Text and type(d.Text) == "string" and
+           (d.Text:find("font color") or d.Text:find("Silent Aim") or
+            d.Text:find("Trigger Bot") or d.Text:find("WalkSpeed") or
+            d.Text:find("DoubleTap") or d.Text:find("Cam Lock") or
+            d.Text:find("Vyron")) then
+            pcall(function() d:Remove() end)
+        end
+    end
+end)
+
+-- runtime toggle states (flipped by each feature's keybind handlers)
+local VyronState = {
+    SilentAim  = false,
+    TriggerBot = false,
+    Speed      = false,
+    DoubleTap  = false,
+    CamLock    = false,
+}
+
+local LabelTitle    = nil  -- "Vyron.cc" header
+local LabelOne      = nil
+local LabelOneSub   = nil  -- green target name for Silent Aim
+local LabelTwo      = nil
+local LabelThree    = nil
+local LabelFour     = nil
+local LabelFive     = nil
+local LabelFiveSub  = nil  -- green target name for Cam Lock
+
+local function MakeLabel()
+    local t = Drawing.new("Text")
+    t.Visible = false
+    t.Center  = true
+    t.Outline = true
+    t.Font    = Drawing.Fonts.UI
+    t.Size    = 18
+    t.ZIndex  = 1000
+    t.Color   = Color3.fromRGB(255, 255, 255)
+    return t
+end
+
+local function UpdateLabels()
+    if not CFG()["General"]["Show Hotkeys"] then
+        if LabelTitle   then LabelTitle.Visible   = false end
+        if LabelOne     then LabelOne.Visible     = false end
+        if LabelOneSub  then LabelOneSub.Visible  = false end
+        if LabelTwo     then LabelTwo.Visible     = false end
+        if LabelThree   then LabelThree.Visible   = false end
+        if LabelFour    then LabelFour.Visible    = false end
+        if LabelFive    then LabelFive.Visible    = false end
+        if LabelFiveSub then LabelFiveSub.Visible = false end
+        return
+    end
+
+    -- lazy-create labels
+    if LabelTitle   == nil then LabelTitle   = MakeLabel() end
+    if LabelOne     == nil then LabelOne     = MakeLabel() end
+    if LabelOneSub  == nil then LabelOneSub  = MakeLabel() end
+    if LabelTwo     == nil then LabelTwo     = MakeLabel() end
+    if LabelThree   == nil then LabelThree   = MakeLabel() end
+    if LabelFour    == nil then LabelFour    = MakeLabel() end
+    if LabelFive    == nil then LabelFive    = MakeLabel() end
+    if LabelFiveSub == nil then LabelFiveSub = MakeLabel() end
+
+    local vp      = Camera.ViewportSize
+    local offsetY = vp.Y - 160
+
+    -- "Vyron.cc" header
+    LabelTitle.Color    = Color3.fromRGB(255, 255, 255)
+    LabelTitle.Outline  = true
+    LabelTitle.Size     = 18
+    LabelTitle.Center   = true
+    LabelTitle.Visible  = true
+    LabelTitle.Text     = 'Vyron.cc'
+    LabelTitle.Position = Vector2.new(vp.X / 2, offsetY)
+    offsetY = offsetY + 18
+
+    -- Silent Aim (label 1)
+    if CFG()["Silent Aim"]["Enabled"] and VyronState.SilentAim then
+        LabelOne.Color    = Color3.fromRGB(255, 255, 255)
+        LabelOne.Outline  = true
+        LabelOne.Size     = 18
+        LabelOne.Center   = true
+        LabelOne.Visible  = true
+        LabelOne.Text     = 'Silent Aim'
+        LabelOne.Position = Vector2.new(vp.X / 2, offsetY)
+        -- at size 13, "Silent Aim" ≈ 70px wide, half = 35; sub goes right after with 4px gap
+        local targetName = SATarget and ('(' .. SATarget.DisplayName .. ')') or '(N/A)'
+        LabelOneSub.Color    = Color3.fromRGB(0, 255, 0)
+        LabelOneSub.Outline  = true
+        LabelOneSub.Size     = 18
+        LabelOneSub.Center   = false
+        LabelOneSub.Visible  = true
+        LabelOneSub.Text     = targetName
+        LabelOneSub.Position = Vector2.new(vp.X / 2 + 39, offsetY)
+        offsetY = offsetY + 18
+    else
+        LabelOne.Visible    = false
+        LabelOneSub.Visible = false
+    end
+
+    -- Trigger Bot (label 2)
+    if CFG()["Trigger Bot"]["Enabled"] and TBActive then
+        LabelTwo.Color    = Color3.fromRGB(255, 255, 255)
+        LabelTwo.Outline  = true
+        LabelTwo.Size     = 18
+        LabelTwo.Center   = true
+        LabelTwo.Visible  = true
+        LabelTwo.Text     = 'Trigger Bot'
+        LabelTwo.Position = Vector2.new(vp.X / 2, offsetY)
+        offsetY = offsetY + 18
+    else
+        LabelTwo.Visible = false
+    end
+
+    -- WalkSpeed (label 3)
+    if CFG()["Player Modifications"]["Speed"]["Enabled"] and VyronState.Speed then
+        LabelThree.Color    = Color3.fromRGB(255, 255, 255)
+        LabelThree.Outline  = true
+        LabelThree.Size     = 18
+        LabelThree.Center   = true
+        LabelThree.Visible  = true
+        LabelThree.Text     = 'WalkSpeed'
+        LabelThree.Position = Vector2.new(vp.X / 2, offsetY)
+        offsetY = offsetY + 18
+    else
+        LabelThree.Visible = false
+    end
+
+    -- Double Tap (label 4)
+    if CFG()["Weapon Modifications"]["Double Tap"]["Enabled"] and VyronState.DoubleTap then
+        LabelFour.Color    = Color3.fromRGB(255, 255, 255)
+        LabelFour.Outline  = true
+        LabelFour.Size     = 18
+        LabelFour.Center   = true
+        LabelFour.Visible  = true
+        LabelFour.Text     = 'Double Tap'
+        LabelFour.Position = Vector2.new(vp.X / 2, offsetY)
+        offsetY = offsetY + 18
+    else
+        LabelFour.Visible = false
+    end
+
+    -- Camera Lock (label 5)
+    if CFG()["Camera Lock"]["Enabled"] and VyronState.CamLock then
+        LabelFive.Color    = Color3.fromRGB(255, 255, 255)
+        LabelFive.Outline  = true
+        LabelFive.Size     = 18
+        LabelFive.Center   = true
+        LabelFive.Visible  = true
+        LabelFive.Text     = 'Cam Lock'
+        LabelFive.Position = Vector2.new(vp.X / 2, offsetY)
+        if CamTarget and CamTarget.Parent then
+            local camName = '(' .. (CamTarget.Parent.DisplayName or CamTarget.Parent.Name) .. ')'
+            LabelFiveSub.Color    = Color3.fromRGB(0, 255, 0)
+            LabelFiveSub.Outline  = true
+            LabelFiveSub.Size     = 18
+            LabelFiveSub.Center   = false
+            LabelFiveSub.Visible  = true
+            LabelFiveSub.Text     = camName
+            -- "Cam Lock" ≈ 56px wide, half = 28; sub goes right after
+            LabelFiveSub.Position = Vector2.new(vp.X / 2 + 32, offsetY)
+        else
+            LabelFiveSub.Visible = false
+        end
+        offsetY = offsetY + 18
+    else
+        LabelFive.Visible    = false
+        LabelFiveSub.Visible = false
+    end
+end
+
+RunService.RenderStepped:Connect(UpdateLabels)
+
+-- ============================================================================
+-- TRIGGER BOT  (only runs if shared.Vyron["Trigger Bot"]["Enabled"] == true)
+-- ============================================================================
+local TBActive = false  -- runtime toggle (keybind flips this)
+local TBLastShot = 0
+local TBStep = 0
+
+local TBCircle = Drawing.new("Circle")
+TBCircle.Visible=false; TBCircle.Transparency=1; TBCircle.Color=Color3.new(1,1,1)
+TBCircle.Filled=true; TBCircle.NumSides=64
+TBCircle.Radius=CFG()["Trigger Bot"]["FOV"]*5
+TBCircle.Position=Vector2.new(Camera.ViewportSize.X/2,Camera.ViewportSize.Y/2)
+
+local function TBGetTarget()
+    local tbCfg=CFG()["Trigger Bot"]
+    local radius=tbCfg["FOV"]*5
+    local center=TBCircle.Position
+    local best,bd=nil,math.huge
+    for _,player in ipairs(Players:GetPlayers()) do
+        if player~=LocalPlayer and player.Character and not PlayerDead(player) and not PlayerKnocked(player) then
+            for _,part in ipairs(GetBodyParts(player.Character)) do
+                if part.Transparency<1 then
+                    local pos=part.Position
+                    if part.Name=="HumanoidRootPart" then
+                        local pred=tbCfg["Prediction"]
+                        pos=pos+Vector3.new(pred["X"],pred["Y"],pred["Z"])
+                        local vel=tbCfg["Velocity"]
+                        if vel and vel["Enabled"] then
+                            local v=part.Velocity
+                            if v.Magnitude>vel["Magnitude"] then pos=pos+v*0.1 end
+                        end
+                    end
+                    local sp,on=Camera:WorldToScreenPoint(pos)
+                    if on and sp.Z>0 then
+                        local d=(Vector2.new(sp.X,sp.Y)-center).Magnitude
+                        if d<=radius and d<bd then bd=d; best=player end
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- Trigger bot keybind - only registers if Enabled==true in config
+UserInputService.InputBegan:Connect(function(input,gp)
+    if gp then return end
+    if not CFG()["Trigger Bot"]["Enabled"] then return end  -- master switch
+    local bind=CFG()["Trigger Bot"]["Bind"]:upper()
+    if input.KeyCode==Enum.KeyCode[bind] then
+        if CFG()["Trigger Bot"]["Type"]=="Toggle" then
+            TBActive=not TBActive
+            VyronState.TriggerBot = TBActive
+            ShowNotification("Trigger Bot", TBActive and "on" or "off", 2)
+        end
+    end
+end)
+UserInputService.InputEnded:Connect(function(input,gp)
+    if gp then return end
+    if not CFG()["Trigger Bot"]["Enabled"] then return end
+    if CFG()["Trigger Bot"]["Type"]=="Hold" then
+        local bind=CFG()["Trigger Bot"]["Bind"]:upper()
+        if input.KeyCode==Enum.KeyCode[bind] then TBActive=false end
+    end
+end)
+
+RunService.Heartbeat:Connect(function(dt)
+    TBStep=TBStep+dt
+    if TBStep<0.05 then return end; TBStep=0
+    local tbCfg=CFG()["Trigger Bot"]
+    -- master switch from config
+    if not tbCfg["Enabled"] then TBCircle.Visible=false; return end
+    if not TBActive then TBCircle.Visible=false; return end
+    TBCircle.Radius=tbCfg["FOV"]*5
+    TBCircle.Position=Vector2.new(Camera.ViewportSize.X/2,Camera.ViewportSize.Y/2)
+    local target=TBGetTarget()
+    if target and LocalPlayer.Character then
+        local tool=LocalPlayer.Character:FindFirstChildOfClass("Tool")
+        if tool and tool:FindFirstChild("Handle") then
+            local function clean(s) return s:lower():gsub("[%[%]%- ]","") end
+            local tn=clean(tool.Name); local ok=false
+            for _,w in ipairs(tbCfg["Weapons"]) do if tn:find(clean(w),1,true) then ok=true; break end end
+            if ok and tick()-TBLastShot>=tbCfg["Cooldown"] then
+                tool:Activate(); tool:Deactivate(); TBLastShot=tick()
+            end
+        end
+    end
+end)
+
+-- ============================================================================
+-- CAMERA LOCK  (only runs if shared.Vyron["Camera Lock"]["Enabled"] == true)
+-- ============================================================================
+local function IsKnockedOut(char)
+    if not char then return false end
+    local be=char:FindFirstChild("BodyEffects")
+    if be then local k=be:FindFirstChild("K.O"); if k and k.Value then return true end end
+    local hum=char:FindFirstChildOfClass("Humanoid")
+    if hum then
+        local s=hum:GetState()
+        if s==Enum.HumanoidStateType.Dead or s==Enum.HumanoidStateType.Physics or s==Enum.HumanoidStateType.Ragdoll then return true end
+    end
+    local hrp=char:FindFirstChild("HumanoidRootPart")
+    if hrp and hrp:FindFirstChild("GRABBING_CONSTRAINT") then return true end
+    return false
+end
+
+-- FOV circle drawing for camera lock
+local CLFovCircle = Drawing.new("Circle")
+CLFovCircle.Filled       = false
+CLFovCircle.Thickness    = 1
+CLFovCircle.Transparency = 1
+CLFovCircle.Color        = Color3.fromRGB(255, 255, 255)
+CLFovCircle.NumSides     = 64
+CLFovCircle.Visible      = false
+
+UserInputService.InputBegan:Connect(function(input,gp)
+    if gp then return end
+    if not CFG()["Camera Lock"]["Enabled"] then return end
+    local bind=CFG()["General"]["Binds"]["Camera Lock"]:upper()
+    if input.KeyCode~=Enum.KeyCode[bind] then return end
+    -- if this key is ALSO the silent aim key, only handle cam lock here
+    -- (silent aim handler below will check the same and skip if cam lock consumed it)
+    if CamLocked then
+        CamLocked=false; CamTarget=nil
+        VyronState.CamLock = false
+    else
+        local clCfg=CFG()["Camera Lock"]
+        local fovCfg=clCfg["FOV"] or {}
+        local useFOV=fovCfg["Enabled"]
+        local fovRadius=fovCfg["Size"] or 120
+        local best,bd=nil,math.huge
+        local mp=UserInputService:GetMouseLocation()
+        for _,p in ipairs(Players:GetPlayers()) do
+            if p~=LocalPlayer and p.Character and not IsKnockedOut(p.Character) then
+                local hrp=p.Character:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    local sp,on=Camera:WorldToViewportPoint(hrp.Position)
+                    if on and sp.Z>0 then
+                        local d=(Vector2.new(sp.X,sp.Y)-mp).Magnitude
+                        if useFOV and d>fovRadius then continue end
+                        if d<bd then bd=d; best=hrp end
+                    end
+                end
+            end
+        end
+        if best then
+            CamLocked=true; CamTarget=best
+            VyronState.CamLock = true
+        end
+    end
+end)
+
+RunService.RenderStepped:Connect(function()
+    local clCfg=CFG()["Camera Lock"]
+    if not clCfg["Enabled"] then
+        CLFovCircle.Visible=false; return
+    end
+
+    -- FOV circle
+    local fovCfg=clCfg["FOV"] or {}
+    if fovCfg["Enabled"] and fovCfg["Visible"] then
+        local mp=UserInputService:GetMouseLocation()
+        CLFovCircle.Position=Vector2.new(mp.X, mp.Y)
+        CLFovCircle.Radius=fovCfg["Size"] or 120
+        CLFovCircle.Visible=true
+    else
+        CLFovCircle.Visible=false
+    end
+
+    if not CamLocked or not CamTarget then return end
+
+    -- validate target still alive
+    local char=CamTarget.Parent
+    if not char or IsKnockedOut(char) then
+        CamLocked=false; CamTarget=nil; VyronState.CamLock=false; return
+    end
+
+    -- prediction: offset aim point by target velocity
+    local pred=clCfg["Prediction"] or 0
+    local vel=Vector3.new(0,0,0)
+    pcall(function()
+        vel=CamTarget.AssemblyLinearVelocity or CamTarget.Velocity or Vector3.new(0,0,0)
+    end)
+    local aimPos=CamTarget.Position + vel*pred
+
+    -- build target CFrame
+    local targetCF=CFrame.new(Camera.CFrame.Position, aimPos)
+
+    -- smoothness: 0 = instant, >0 = lerp
+    local smooth=clCfg["Smoothness"] or 0
+    if smooth>0 then
+        -- clamp so it never fully stops (min alpha = 0.01)
+        local alpha=math.clamp(1 - smooth, 0.01, 1)
+        Camera.CFrame=Camera.CFrame:Lerp(targetCF, alpha)
+    else
+        Camera.CFrame=targetCF
+    end
+end)
+
+-- ============================================================================
+-- SILENT AIM  (only active if shared.Vyron["Silent Aim"]["Enabled"] == true)
+-- ============================================================================
+local SACurrentTarget = nil  -- the body part being aimed at
+local SALastMousePos  = Vector2.new(0,0)
+local SALastUpdate    = 0
+
+local SACircle = Drawing.new("Circle")
+SACircle.Transparency=1; SACircle.Thickness=1.5; SACircle.Color=Color3.new(1,1,1)
+SACircle.NumSides=128; SACircle.Filled=false
+SACircle.Radius=CFG()["Silent Aim"]["FOV"]["Size"]*5
+SACircle.Visible=CFG()["Silent Aim"]["Enabled"] and CFG()["Silent Aim"]["FOV"]["Enabled"] and CFG()["Silent Aim"]["FOV"]["Visible"]
+
+local function SAIsShiftLock()
+    if LocalPlayer.Character then
+        local tool=LocalPlayer.Character:FindFirstChildOfClass("Tool")
+        if tool and tool:FindFirstChild("Ammo") then return true end
+    end
+    local pg=LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if pg then local ag=pg:FindFirstChild("Aim"); if ag and ag.Visible then return true end end
+    local mouse=LocalPlayer:GetMouse()
+    if mouse.Icon=="rbxasset://SystemCursors/Cross" then return true end
+    local pm=LocalPlayer.PlayerScripts:FindFirstChild("PlayerModule")
+    if pm then
+        local cm=pm:FindFirstChild("CameraModule")
+        if cm then
+            local mlc=cm:FindFirstChild("MouseLockController")
+            if mlc then local iml=mlc:FindFirstChild("isMouseLocked"); if iml and iml.Value then return true end end
+        end
+    end
+    return false
+end
+
+local function SAGetClosestPoint(player)
+    local best,bd=nil,math.huge
+    local scale=(CFG()["Silent Aim"]["Closest Point"] or {})["Scale"] or 1.0
+    if player.Character then
+        for _,part in ipairs(GetBodyParts(player.Character)) do
+            local sp,on=Camera:WorldToViewportPoint(part.Position)
+            if on and sp.Z>0 then
+                local d=(SALastMousePos-Vector2.new(sp.X,sp.Y)).Magnitude*scale
+                if d<bd then best=part; bd=d end
+            end
+        end
+    end
+    return best
+end
+
+-- FOV circle: every render frame, zero throttle
+RunService.RenderStepped:Connect(function()
+    local saCfg=CFG()["Silent Aim"]
+    local fovCfg=saCfg["FOV"]
+    SACircle.Visible = saCfg["Enabled"] and fovCfg["Enabled"] and fovCfg["Visible"]
+    if not SACircle.Visible then return end
+    if SAIsShiftLock() then
+        local c=Vector2.new(Camera.ViewportSize.X*0.5,Camera.ViewportSize.Y*0.5)
+        SACircle.Position=c; SALastMousePos=c
+    else
+        local mp=UserInputService:GetMouseLocation()
+        SACircle.Position=mp; SALastMousePos=mp
+    end
+end)
+
+-- Target finding: throttled
+RunService.Heartbeat:Connect(function(dt)
+    SALastUpdate=SALastUpdate+dt
+    if SALastUpdate<0.033 then return end; SALastUpdate=0
+    local saCfg=CFG()["Silent Aim"]
+    if not saCfg["Enabled"] then SACurrentTarget=nil; return end
+
+    local fovCfg=saCfg["FOV"]
+    local radius=fovCfg["Size"]*5
+    if fovCfg["Weapons"]["Enabled"] then
+        local tool=LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Tool")
+        if tool then
+            local wn=string.lower(tool.Name or "")
+            if string.find(wn,"shotgun") then radius=fovCfg["Weapons"]["Shotguns"]*5
+            elseif string.find(wn,"pistol") then radius=fovCfg["Weapons"]["Pistols"]*5 end
+        end
+    end
+    SACircle.Radius=radius
+
+    -- if we have a locked target, only aim at them
+    if SATarget then
+        if PlayerDead(SATarget) or PlayerKnocked(SATarget) then
+            SATarget=nil; SAActive=false
+            ShowNotification("Silent Aim","target lost",2); SACurrentTarget=nil; return
+        end
+        local hp=saCfg["Hit Part"]
+        local part = hp=="Closest Point" and SAGetClosestPoint(SATarget)
+            or SATarget.Character and SATarget.Character:FindFirstChild(hp or "Head")
+        SACurrentTarget=part; return
+    end
+
+    SACurrentTarget=nil
+end)
+
+-- Keybind: press to lock nearest in FOV, press again to unlock
+-- Runs independently — if cam lock shares this key both still fire separately
+UserInputService.InputBegan:Connect(function(input,gp)
+    if gp then return end
+    if not CFG()["Silent Aim"]["Enabled"] then return end
+    local bind=CFG()["General"]["Binds"]["Silent Aim"]:upper()
+    if input.KeyCode~=Enum.KeyCode[bind] then return end
+    if SATarget then
+        SATarget=nil; SAActive=false
+        VyronState.SilentAim = false
+    else
+        local best,bd=nil,math.huge
+        local mp=UserInputService:GetMouseLocation()
+        local radius=CFG()["Silent Aim"]["FOV"]["Size"]*5
+        for _,p in ipairs(Players:GetPlayers()) do
+            if p~=LocalPlayer and p.Character and not PlayerDead(p) and not PlayerKnocked(p) then
+                local hrp=p.Character:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    local sp,on=Camera:WorldToViewportPoint(hrp.Position)
+                    if on and sp.Z>0 then
+                        local d=(Vector2.new(sp.X,sp.Y)-mp).Magnitude
+                        if d<=radius and d<bd then bd=d; best=p end
+                    end
+                end
+            end
+        end
+        if best then
+            SATarget=best; SAActive=true
+            VyronState.SilentAim = true
+        end
+    end
+end)
+
+-- Metatable hook
+if Capabilities[5] then
+    local ok=pcall(function()
+        local mt=getrawmetatable(game)
+        setreadonly(mt,false)
+        local oldIdx=mt.__index
+        mt.__index=newcclosure(function(obj,key)
+            if obj:IsA("Mouse") and (key=="Hit" or key=="Target") then
+                local saCfg=CFG()["Silent Aim"]
+                local target=SACurrentTarget
+                if target and SAActive and saCfg["Enabled"] then
+                    local pred=saCfg["Prediction"]
+                    local redir=saCfg["Client Redirect"]
+                    local tool=LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Tool")
+                    if redir["Enabled"] and tool then
+                        for _,w in ipairs(redir["Weapons"]) do
+                            if string.find(string.lower(tostring(tool.Name)),string.lower(w)) then
+                                pred=redir["Prediction"]; break
+                            end
+                        end
+                    end
+                    local offset=target.Velocity*Vector3.new(pred["X"],pred["Y"],pred["Z"])
+                    local cf=target.CFrame*CFrame.new(offset.X,offset.Y,offset.Z)
+                    if key=="Hit" then return cf else return target end
+                end
+            end
+            return oldIdx(obj,key)
+        end)
+    end)
+    if ok then print("[Silent Aim] Metatable hook enabled")
+    else warn("[Silent Aim] Metatable hook failed"); ShowNotification("Silent Aim","basic mode",4) end
+else
+    warn("[Silent Aim] Not supported"); ShowNotification("Silent Aim","limited mode",4)
+end
+
+-- ============================================================================
+-- SPREAD CHANGER  (hooks math.random globally — works on all weapons)
+-- ============================================================================
+do
+    local sc=CFG()["Weapon Modifications"]["Spread Changer"]
+    if sc["Enabled"] then
+        local oldRandom
+        pcall(function()
+            oldRandom=hookfunction(math.random,function(...)
+                if checkcaller() then return oldRandom(...) end
+                local scCfg=CFG()["Weapon Modifications"]["Spread Changer"]
+                if not scCfg["Enabled"] then return oldRandom(...) end
+                local args={...}
+                -- intercept spread calls: math.random() or math.random(-x, x) patterns
+                if #args==0 or (args[1] and type(args[1])=="number" and args[1]<0) then
+                    local amt=scCfg["Amount"] or 0
+                    -- amt=0 means 0 spread, scale up from there
+                    if amt==0 then return 0 end
+                    return oldRandom(...) * (amt/100)
+                end
+                return oldRandom(...)
+            end)
+        end)
+    end
+end
+
+-- ============================================================================
+-- WALKSPEED  (only runs if shared.Vyron["Player Modifications"]["Speed"]["Enabled"] == true)
+-- ============================================================================
+do
+    local spd=CFG()["Player Modifications"]["Speed"]
+    if spd["Enabled"] then
+        local speedOn=false
+        local char=LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+        local hum=char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid")
+        local shooting,reloading=false,false
+        local mouse=LocalPlayer:GetMouse()
+        mouse.Button1Down:Connect(function() shooting=true end)
+        mouse.Button1Up:Connect(function() shooting=false end)
+        LocalPlayer.CharacterAdded:Connect(function(c)
+            char=c; hum=c:FindFirstChildOfClass("Humanoid") or c:WaitForChild("Humanoid")
+            shooting=false; reloading=false; speedOn=false
+        end)
+        UserInputService.InputBegan:Connect(function(input,gp)
+            if gp then return end
+            if input.KeyCode==Enum.KeyCode.R and not reloading then
+                reloading=true; task.delay(1.5,function() reloading=false end)
+            end
+            local bind=CFG()["General"]["Binds"]["Speed"] or "X"
+            if input.KeyCode==Enum.KeyCode[bind:upper()] then
+                speedOn=not speedOn
+                VyronState.Speed = speedOn
+                if not speedOn and hum then hum.WalkSpeed=16 end
+            end
+        end)
+        RunService.RenderStepped:Connect(function()
+            local s=CFG()["Player Modifications"]["Speed"]
+            if not s["Enabled"] or not speedOn then
+                if hum then hum.WalkSpeed=16 end; return
+            end
+            if not hum or hum.Health<=0 then return end
+            local speed=s["Default"]["Value"]
+            if hum.Health<50 then speed=s["Low Health"]["Value"]
+            elseif reloading then speed=s["Reloading"]["Value"]
+            elseif shooting then speed=s["Shooting"]["Value"] end
+            if hum.WalkSpeed~=speed then hum.WalkSpeed=speed end
+        end)
+    end
+end
+
+-- ============================================================================
+-- RAPID FIRE  (hold mouse1 to shoot fast — shared.Vyron["Weapon Modifications"]["Rapid Fire"]["Enabled"] == true)
+-- ============================================================================
+do
+    local isMouseDown=false
+    UserInputService.InputBegan:Connect(function(i,gp)
+        if not gp and i.UserInputType==Enum.UserInputType.MouseButton1 then isMouseDown=true end
+    end)
+    UserInputService.InputEnded:Connect(function(i,gp)
+        if not gp and i.UserInputType==Enum.UserInputType.MouseButton1 then isMouseDown=false end
+    end)
+    task.spawn(function()
+        while true do
+            local rfCfg=CFG()["Weapon Modifications"]["Rapid Fire"]
+            if rfCfg["Enabled"] and isMouseDown then
+                local tool=LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Tool")
+                if tool then tool:Activate() end
+            end
+            local cd=rfCfg and rfCfg["Cooldown"] or 0
+            task.wait(cd > 0 and cd or nil)
+        end
+    end)
+end
+
+-- ============================================================================
+-- DOUBLE TAP  (fires an extra shot before the main shot on matching weapons)
+-- Only active if shared.Vyron["Weapon Modifications"]["Double Tap"]["Enabled"] == true
+-- ============================================================================
+do
+    local DTActive = false  -- runtime toggle
+    local DTLastShot = 0
+
+    -- keybind toggle
+    UserInputService.InputBegan:Connect(function(input, gp)
+        if gp then return end
+        if not CFG()["Weapon Modifications"]["Double Tap"]["Enabled"] then return end
+        local bind = CFG()["General"]["Binds"]["Double Tap"]:upper()
+        if input.KeyCode == Enum.KeyCode[bind] then
+            DTActive = not DTActive
+            VyronState.DoubleTap = DTActive
+            ShowNotification("Double Tap", DTActive and "on" or "off", 2)
+        end
+    end)
+
+    -- hook into tool activation to fire the extra shot
+    local function OnCharacterAdded(char)
+        char.ChildAdded:Connect(function(child)
+            if not child:IsA("Tool") then return end
+            child.Activated:Connect(function()
+                local dtCfg = CFG()["Weapon Modifications"]["Double Tap"]
+                if not dtCfg["Enabled"] or not DTActive then return end
+
+                -- check weapon is in the allowed list
+                local toolName = child.Name
+                local allowed = false
+                for _, w in ipairs(dtCfg["Weapons"]) do
+                    local function clean(s) return s:lower():gsub("[%[%]%- ]", "") end
+                    if clean(toolName):find(clean(w), 1, true) then
+                        allowed = true; break
+                    end
+                end
+                if not allowed then return end
+
+                -- cooldown guard so we don't stack infinitely
+                local now = tick()
+                if now - DTLastShot < 0.05 then return end
+                DTLastShot = now
+
+                -- fire the extra shot: activate → small delay → let normal shot proceed
+                local handle = child:FindFirstChild("Handle")
+                if handle then
+                    local toolEvent = child:FindFirstChild("RemoteEvent")
+                    if toolEvent then
+                        toolEvent:FireServer("Shoot")
+                    end
+                    -- play the shoot animation client-side if available
+                    pcall(function()
+                        local anim = LocalPlayer.Character.Humanoid.Animator
+                        local shootAnim = game:GetService("ReplicatedStorage")
+                            :WaitForChild("Animations")
+                            :WaitForChild("GunCombat")
+                            :WaitForChild("Shoot")
+                        anim:LoadAnimation(shootAnim):Play()
+                    end)
+                end
+            end)
+        end)
+    end
+
+    -- connect for current and future characters
+    if LocalPlayer.Character then OnCharacterAdded(LocalPlayer.Character) end
+    LocalPlayer.CharacterAdded:Connect(OnCharacterAdded)
+end
+
+-- ============================================================================
+-- INFINITE RANGE
+-- Method 'property' : sets Range/FireRange/Distance values on the tool every frame (original)
+-- Method 'renderstep': uses RenderStepped to pin range props — same as reference script
+-- Both run if Enabled = true; Method is chosen by ['Method'] in config
+-- ============================================================================
+do
+    local ir=CFG()["Weapon Modifications"]["Infinite Range"]
+    if ir and ir["Enabled"] then
+        local RANGE=ir["Range"] or 900000000
+        local PROPS={"Range","MaxRange","FireRange","Distance","MaxDistance","BulletRange"}
+        local function applyRange()
+            local char=LocalPlayer.Character
+            local tool=char and char:FindFirstChildOfClass("Tool")
+            if not tool then return end
+            for _,prop in ipairs(PROPS) do
+                local v=tool:FindFirstChild(prop)
+                if v and (v:IsA("NumberValue") or v:IsA("IntValue")) then v.Value=RANGE end
+                local gc=tool:FindFirstChild("Configuration") or tool:FindFirstChild("GunConfig")
+                if gc then local r=gc:FindFirstChild(prop); if r and (r:IsA("NumberValue") or r:IsA("IntValue")) then r.Value=RANGE end end
+            end
+        end
+        local method=(ir["Method"] or "renderstep"):lower()
+        if method=="renderstep" then
+            RunService.RenderStepped:Connect(function()
+                if not CFG()["Weapon Modifications"]["Infinite Range"]["Enabled"] then return end
+                applyRange()
+            end)
+        else
+            -- 'property' method: heartbeat
+            RunService.Heartbeat:Connect(function()
+                if not CFG()["Weapon Modifications"]["Infinite Range"]["Enabled"] then return end
+                applyRange()
+            end)
+        end
+    end
+end
+
+print("[Vyron] Loaded. Executor: "..ExecutorName)
+print("[Vyron] Features: "..(Capabilities[5] and "Full" or "Limited"))
