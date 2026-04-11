@@ -6,7 +6,7 @@
 -- ============================================================================
 -- KEY VALIDATION (runs automatically when mooze.txt loads)
 -- ============================================================================
-local API_URL = "YOUR_RAILWAY_URL"  -- e.g. https://yourapp.up.railway.app
+local API_URL = "https://bypass-production-5fff.up.railway.app"
 
 local function KickPlayer(reason)
     game:GetService("Players").LocalPlayer:Kick(
