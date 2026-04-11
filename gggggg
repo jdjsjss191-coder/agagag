@@ -44,8 +44,43 @@ assert(shared.Vyron["Silent Aim"],  "[Vyron] Invalid config - missing Silent Aim
 local function CFG() return shared.Vyron end
 
 -- ============================================================================
--- AC BYPASS
+-- KEY SYSTEM
 -- ============================================================================
+do
+    local LocalPlayer = game:GetService("Players").LocalPlayer
+    local HttpService = game:GetService("HttpService")
+
+    local userKey = tostring((CFG()["Key System"] or {})["Key"] or "")
+    assert(userKey ~= "" and userKey ~= "YOUR-KEY-HERE", "[Vyron] No key set in config.")
+
+    local hwid = tostring(game:GetService("RbxAnalyticsService"):GetClientId())
+    local API  = "https://bypass-production-954a.up.railway.app/check"
+
+    local ok, res = pcall(function()
+        return game:HttpGet(API .. "?key=" .. userKey .. "&hwid=" .. hwid)
+    end)
+
+    local valid  = false
+    local reason = "Invalid key"
+    if ok and res then
+        pcall(function()
+            local data = HttpService:JSONDecode(res)
+            valid  = data.valid
+            reason = data.reason or reason
+        end)
+    end
+
+    if not valid then
+        -- Prints the full reason to console — shows blacklist message if blacklisted
+        print("[Vyron] Access denied: " .. reason)
+        LocalPlayer:Kick("Vyron — " .. reason)
+        return
+    end
+
+    print("[Vyron] Key accepted.")
+end
+
+
 if Capabilities[1] and Capabilities[2] and Capabilities[3] then
     print("[Vyron] Initializing AC bypass...")
     local MessageOut = game:GetService("LogService").MessageOut
